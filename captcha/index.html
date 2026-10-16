@@ -7,23 +7,32 @@
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root{--bg:var(--tg-theme-bg-color,#0f1115);--fg:var(--tg-theme-text-color,#e8e8ea);
-        --hint:var(--tg-theme-hint-color,#8b8f98);--card:var(--tg-theme-secondary-bg-color,#171a21)}
+        --hint:var(--tg-theme-hint-color,#8b8f98);--card:var(--tg-theme-secondary-bg-color,#171a21);
+        --acc:var(--tg-theme-button-color,#2ea6ff)}
   *{box-sizing:border-box}
   body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);
        font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
        display:flex;align-items:center;justify-content:center;padding:20px}
   .card{width:100%;max-width:380px;background:var(--card);border-radius:18px;padding:24px 20px;text-align:center}
   h1{font-size:19px;margin:0 0 6px}
-  p{margin:0 0 18px;color:var(--hint)}
+  p{margin:0 0 16px;color:var(--hint)}
+  #timer{display:flex;justify-content:center;align-items:baseline;gap:6px;
+         font-weight:600;font-variant-numeric:tabular-nums;margin-bottom:8px}
+  #secs{font-size:22px}
+  #bar{height:6px;border-radius:3px;background:rgba(139,143,152,.25);overflow:hidden;margin-bottom:16px}
+  #fill{height:100%;width:100%;background:var(--acc);border-radius:3px;transition:width .25s linear}
+  #fill.low{background:#ff6b6b}
   #box{display:flex;justify-content:center;min-height:80px}
-  #status{margin-top:16px;min-height:22px;font-weight:600}
-  .ok{color:#3ecf8e}.err{color:#ff6b6b}
+  #status{margin-top:14px;min-height:22px;font-weight:600}
+  .ok{color:#3ecf8e}.err{color:#ff6b6b}.warn{color:#e8b93e}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>🎁 Последний шаг до награды</h1>
   <p>Реши капчу — бот сразу продолжит и выдаст ссылку.</p>
+  <div id="timer">⏳ <span id="secs">30</span> сек</div>
+  <div id="bar"><div id="fill"></div></div>
   <div id="box"></div>
   <div id="status"></div>
 </div>
@@ -33,21 +42,70 @@
   var q = new URLSearchParams(location.search);
   var rid = q.get('rid') || '';
   var sitekey = q.get('sitekey') || '';
+
+  // t — сколько секунд бот отвёл на решение (по умолчанию 30, как и живая
+  // капча), ts — unix-момент, когда бот отправил кнопку.  Без ts отсчёт шёл бы
+  // с момента открытия страницы и юзер получал бы больше времени, чем есть
+  // на самом деле — бот уже отдал бы капчу кому-то другому.
+  var budget = parseInt(q.get('t') || '', 10);
+  if (!isFinite(budget) || budget <= 0) budget = 30;
+  budget = Math.max(5, Math.min(300, budget));
+  var sentAt = parseInt(q.get('ts') || '', 10);
+  if (!isFinite(sentAt) || sentAt <= 0) sentAt = 0;
+  var openedAt = Date.now();
+
   var statusEl = document.getElementById('status');
-  var sent = false;
+  var secsEl = document.getElementById('secs');
+  var fillEl = document.getElementById('fill');
+  var sent = false;      // sendData отдаётся ровно один раз
+  var finished = false;  // токен отправлен / время вышло
 
   function status(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
+
+  function remaining() {
+    var elapsed;
+    if (sentAt) {
+      elapsed = Date.now() / 1000 - sentAt;
+      if (!isFinite(elapsed) || elapsed < 0) elapsed = 0;
+    } else {
+      elapsed = (Date.now() - openedAt) / 1000;
+    }
+    var left = budget - elapsed;
+    return left > 0 ? left : 0;
+  }
+
   function send(payload) {
     if (sent) return;
-    sent = true;
     payload.rid = rid;
-    try { tg.sendData(JSON.stringify(payload)); }
-    catch (e) { sent = false; status('Открой страницу кнопкой в боте.', 'err'); }
+    try { tg.sendData(JSON.stringify(payload)); sent = true; }
+    catch (e) { status('Открой страницу кнопкой в боте.', 'err'); }
+  }
+
+  function giveUp() {
+    if (finished) return;
+    finished = true;
+    status('Время вышло — попроси ссылку ещё раз.', 'err');
+    send({ error: 'timeout' });
+  }
+
+  function tick() {
+    if (finished) return;
+    var left = remaining();
+    secsEl.textContent = String(Math.ceil(left));
+    fillEl.style.width = ((left / budget) * 100).toFixed(1) + '%';
+    if (left <= 10) { fillEl.classList.add('low'); } else { fillEl.classList.remove('low'); }
+    if (left <= 0) { giveUp(); return; }
+    setTimeout(tick, 250);
   }
 
   if (tg) { tg.ready(); tg.expand(); }
   if (!tg || !tg.initData) { status('Открой страницу кнопкой в боте.', 'err'); return; }
-  if (!rid || !/^[0-9a-f-]{20,64}$/i.test(sitekey)) { status('Ссылка устарела — запроси заново.', 'err'); return; }
+  if (!rid || !/^[0-9a-f-]{20,64}$/i.test(sitekey)) {
+    status('Ссылка устарела — запроси заново.', 'err');
+    return;
+  }
+
+  tick();
 
   window.onHcaptchaLoad = function () {
     try {
@@ -55,24 +113,40 @@
         sitekey: sitekey,
         theme: (tg.colorScheme === 'light') ? 'light' : 'dark',
         callback: function (token) {
+          if (finished) return;
+          finished = true;
           status('Готово ✓ возвращаю в бот…', 'ok');
-          send({token: token});
+          send({ token: token });
         },
-        'expired-callback': function () { status('Капча истекла — реши ещё раз.', 'err'); },
+        'expired-callback': function () {
+          // Токен сгорел — виджет сам перерисуется, времени ещё хватает.
+          if (finished) return;
+          status('Капча истекла — реши ещё раз, быстро.', 'warn');
+        },
         'error-callback': function (code) {
+          if (finished) return;
+          finished = true;
           status('Ошибка капчи: ' + code, 'err');
-          send({error: String(code || 'error')});
+          send({ error: String(code || 'error') });
         }
       });
     } catch (e) {
+      if (finished) return;
+      finished = true;
       status('Не удалось загрузить капчу.', 'err');
-      send({error: 'render:' + (e && e.message || e)});
+      send({ error: 'render:' + (e && e.message || e) });
     }
   };
+
   var s = document.createElement('script');
   s.src = 'https://js.hcaptcha.com/1/api.js?onload=onHcaptchaLoad&render=explicit&hl=ru';
   s.async = true; s.defer = true;
-  s.onerror = function () { status('hCaptcha не загрузилась.', 'err'); send({error: 'script'}); };
+  s.onerror = function () {
+    if (finished) return;
+    finished = true;
+    status('hCaptcha не загрузилась.', 'err');
+    send({ error: 'script' });
+  };
   document.head.appendChild(s);
 })();
 </script>

@@ -25,6 +25,8 @@
   #fill.low{background:#ff6b6b}
   #box{display:flex;justify-content:center;min-height:80px}
   #status{margin-top:14px;min-height:22px;font-weight:600}
+  #verdict{margin:-8px 0 16px;padding:10px 12px;border-radius:10px;font-size:13px;line-height:1.35;
+           background:rgba(255,107,107,.12);border:1px solid rgba(255,107,107,.35);text-align:left}
   .ok{color:#3ecf8e}.err{color:#ff6b6b}.warn{color:#e8b93e}
 </style>
 </head>
@@ -32,6 +34,7 @@
 <div class="card">
   <h1 id="title">🎁 Последний шаг до награды</h1>
   <div id="round"></div>
+  <div id="verdict" style="display:none"></div>
   <p>Реши капчу — бот сразу продолжит и выдаст ссылку.</p>
   <div id="timer">⏳ <span id="secs">30</span> сек</div>
   <div id="bar"><div id="fill"></div></div>
@@ -66,11 +69,37 @@
   if (!isFinite(total) || total < 1) total = 1;
   total = Math.min(total, 6);
 
+  // b — порт локального приёмника бота.  Если он есть, токен уходит POST-ом
+  // на 127.0.0.1 и окно НЕ закрывается: три задания решаются в одном
+  // открытии.  Без него остаётся sendData, а он закрывает мини-апп — это
+  // поведение Telegram, не наше.
+  var bridgePort = parseInt(q.get('b') || '', 10);
+  if (!isFinite(bridgePort) || bridgePort <= 0) bridgePort = 0;
+
   var round = 1;        // текущее задание
   var sentRound = 0;    // номер задания, за который уже отдан токен
   var gen = 0;          // поколение отсчёта: старый tick умирает при смене задания
   var finished = false; // токен отправлен (последнее задание) / время вышло
   var clockAt = 0;      // unix-момент, от которого считается текущее задание
+
+  // Почему предыдущая капча не засчиталась — приходит от бота в `e`.  Без
+  // этого серверный отказ виден только в логе бота, а человек решает снова
+  // вслепую и получает то же самое.
+  var lastVerdict = (q.get('e') || '').trim();
+  var VERDICT_TEXT = {
+    'hcaptcha:rejected': 'Сервер не принял этот токен. Реши капчу заново — она уже новая.',
+    'hcaptcha:too_late': 'Сервер ответил «слишком поздно»: капча устарела, пока ты её решал. Решай следующую сразу.',
+    'hcaptcha:expired': 'Токен истёк до отправки. Реши новую капчу и не тяни.',
+    'timeout': 'Предыдущее окно закрылось без ответа.',
+  };
+  var verdictEl = document.getElementById('verdict');
+  if (lastVerdict) {
+    var hint = VERDICT_TEXT[lastVerdict];
+    verdictEl.innerHTML = '❌ Предыдущая капча не засчитана' +
+      (hint ? ': ' + hint : ' — ' + lastVerdict.replace(/[<>]/g, '')) +
+      ' <span style="opacity:.55">(' + lastVerdict.replace(/[<>]/g, '') + ')</span>';
+    verdictEl.style.display = '';
+  }
 
   var titleEl = document.getElementById('title');
   var roundEl = document.getElementById('round');
@@ -93,6 +122,25 @@
   function remaining() {
     var left = budget - (Date.now() / 1000 - clockAt);
     return left > 0 ? left : 0;
+  }
+
+  function postLocal(payload) {
+    if (!bridgePort) return Promise.resolve(false);
+    var url = 'http://127.0.0.1:' + bridgePort + '/captcha';
+    var fallback = new Promise(function (resolve) {
+      setTimeout(function () { resolve(null); }, 2000);
+    });
+    var request = fetch(url, {
+      method: 'POST',
+      mode: 'cors',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(payload)
+    }).then(function (response) {
+      return response.ok ? response.json() : null;
+    }).catch(function () { return null; });
+    return Promise.race([request, fallback]).then(function (data) {
+      return !!(data && data.ok);
+    });
   }
 
   function send(payload) {
@@ -144,16 +192,24 @@
   function onSolved(token) {
     if (finished || sentRound === round) return;
     sentRound = round;
-    if (round >= total) {
-      finished = true;
-      status('Готово ✓ возвращаю в бот…', 'ok');
-      send({ token: token });
-      return;
-    }
-    status('Готово ✓ готовлю задание ' + (round + 1) + '…', 'ok');
-    send({ token: token });
-    round += 1;
-    setTimeout(function () { startRound(); }, 400);
+    var isLast = round >= total;
+    var goNext = function () {
+      if (isLast) {
+        finished = true;
+        status('Готово ✓ всё решено, можно закрывать.', 'ok');
+        return;
+      }
+      round += 1;
+      status('Готово ✓ готовлю задание ' + round + '…', 'ok');
+      setTimeout(function () { startRound(); }, 400);
+    };
+    // Сначала петля: окно остаётся открытым и сразу получает следующее
+    // задание.  Не вышло (нет порта, PNA/сеть) — старый путь через
+    // sendData, он закроет окно, но токен дойдёт.
+    postLocal({ rid: rid, token: token, round: round }).then(function (ok) {
+      if (!ok) send({ token: token });
+      goNext();
+    });
   }
 
   function renderWidget() {

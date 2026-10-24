@@ -15,6 +15,7 @@
        display:flex;align-items:center;justify-content:center;padding:20px}
   .card{width:100%;max-width:380px;background:var(--card);border-radius:18px;padding:24px 20px;text-align:center}
   h1{font-size:19px;margin:0 0 6px}
+  #round{font-size:13px;font-weight:600;color:var(--hint);margin:0 0 10px;min-height:18px}
   p{margin:0 0 16px;color:var(--hint)}
   #timer{display:flex;justify-content:center;align-items:baseline;gap:6px;
          font-weight:600;font-variant-numeric:tabular-nums;margin-bottom:8px}
@@ -29,7 +30,8 @@
 </head>
 <body>
 <div class="card">
-  <h1>🎁 Последний шаг до награды</h1>
+  <h1 id="title">🎁 Последний шаг до награды</h1>
+  <div id="round"></div>
   <p>Реши капчу — бот сразу продолжит и выдаст ссылку.</p>
   <div id="timer">⏳ <span id="secs">30</span> сек</div>
   <div id="bar"><div id="fill"></div></div>
@@ -43,7 +45,7 @@
   var rid = q.get('rid') || '';
   var sitekey = q.get('sitekey') || '';
 
-  // t — сколько секунд бот отвёл на решение (по умолчанию 30, как и живая
+  // t — сколько секунд бот отвёл на одно задание (по умолчанию 30, как и живая
   // капча), ts — unix-момент, когда бот отправил кнопку.  Без ts отсчёт шёл бы
   // с момента открытия страницы и юзер получал бы больше времени, чем есть
   // на самом деле — бот уже отдал бы капчу кому-то другому.
@@ -52,32 +54,52 @@
   budget = Math.max(5, Math.min(300, budget));
   var sentAt = parseInt(q.get('ts') || '', 10);
   if (!isFinite(sentAt) || sentAt <= 0) sentAt = 0;
-  var openedAt = Date.now();
 
+  // n — сколько заданий бот ждёт за один проход.  Гейт work.ink просит до трёх
+  // капч подряд, и каждая следующая появляется только после того, как сервер
+  // принял предыдущий токен.  Поэтому страница не закрывается после первого
+  // ответа: она сразу рисует следующее задание, со своим отсчётом, и шлёт
+  // каждый токен отдельно.  Если клиент всё-таки закрывает мини-апп на
+  // sendData, кнопка в чате остаётся рабочей — бот переиспользует тот же
+  // rid, и отсчёт начинает новое задание с полного бюджета.
+  var total = parseInt(q.get('n') || '1', 10);
+  if (!isFinite(total) || total < 1) total = 1;
+  total = Math.min(total, 6);
+
+  var round = 1;        // текущее задание
+  var sentRound = 0;    // номер задания, за который уже отдан токен
+  var gen = 0;          // поколение отсчёта: старый tick умирает при смене задания
+  var finished = false; // токен отправлен (последнее задание) / время вышло
+  var clockAt = 0;      // unix-момент, от которого считается текущее задание
+
+  var titleEl = document.getElementById('title');
+  var roundEl = document.getElementById('round');
   var statusEl = document.getElementById('status');
   var secsEl = document.getElementById('secs');
   var fillEl = document.getElementById('fill');
-  var sent = false;      // sendData отдаётся ровно один раз
-  var finished = false;  // токен отправлен / время вышло
+  var boxEl = document.getElementById('box');
 
   function status(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
 
+  // Каждое задание — свой полный отсчёт.  Единственное исключение — первое
+  // открытие кнопки: там важен реальный возраст запроса, чтобы не решать уже
+  // мёртвую капчу.  Повторное открытие той же кнопки (следующее задание)
+  // получает свежие 30 секунд.
+  function armClock() {
+    var nowSec = Date.now() / 1000;
+    if (round === 1 && sentAt && nowSec - sentAt < budget) clockAt = sentAt;
+    else clockAt = nowSec;
+  }
+
   function remaining() {
-    var elapsed;
-    if (sentAt) {
-      elapsed = Date.now() / 1000 - sentAt;
-      if (!isFinite(elapsed) || elapsed < 0) elapsed = 0;
-    } else {
-      elapsed = (Date.now() - openedAt) / 1000;
-    }
-    var left = budget - elapsed;
+    var left = budget - (Date.now() / 1000 - clockAt);
     return left > 0 ? left : 0;
   }
 
   function send(payload) {
-    if (sent) return;
     payload.rid = rid;
-    try { tg.sendData(JSON.stringify(payload)); sent = true; }
+    payload.round = round;
+    try { tg.sendData(JSON.stringify(payload)); }
     catch (e) { status('Открой страницу кнопкой в боте.', 'err'); }
   }
 
@@ -88,43 +110,63 @@
     send({ error: 'timeout' });
   }
 
-  function tick() {
-    if (finished) return;
+  function tick(myGen) {
+    if (finished || myGen !== gen) return;
     var left = remaining();
     secsEl.textContent = String(Math.ceil(left));
     fillEl.style.width = ((left / budget) * 100).toFixed(1) + '%';
     if (left <= 10) { fillEl.classList.add('low'); } else { fillEl.classList.remove('low'); }
     if (left <= 0) { giveUp(); return; }
-    setTimeout(tick, 250);
+    setTimeout(function () { tick(myGen); }, 250);
   }
 
-  if (tg) { tg.ready(); tg.expand(); }
-  if (!tg || !tg.initData) { status('Открой страницу кнопкой в боте.', 'err'); return; }
-  if (!rid || !/^[0-9a-f-]{20,64}$/i.test(sitekey)) {
-    status('Ссылка устарела — запроси заново.', 'err');
-    return;
+  function startRound() {
+    gen += 1;
+    armClock();
+    if (total > 1) {
+      titleEl.textContent = '🎁 Задание ' + round + ' из ' + total;
+      roundEl.textContent = round === 1
+        ? 'Все задания подряд, без повторного открытия'
+        : 'Задание ' + round + ' — столько же времени';
+    }
+    status('');
+    secsEl.textContent = String(Math.ceil(remaining()));
+    fillEl.classList.remove('low');
+    renderWidget();
+    tick(gen);
   }
 
-  tick();
+  function onSolved(token) {
+    if (finished || sentRound === round) return;
+    sentRound = round;
+    if (round >= total) {
+      finished = true;
+      status('Готово ✓ возвращаю в бот…', 'ok');
+      send({ token: token });
+      return;
+    }
+    status('Готово ✓ готовлю задание ' + (round + 1) + '…', 'ok');
+    send({ token: token });
+    round += 1;
+    setTimeout(function () { startRound(); }, 400);
+  }
 
-  window.onHcaptchaLoad = function () {
+  function renderWidget() {
+    var holder = document.createElement('div');
+    boxEl.innerHTML = '';
+    boxEl.appendChild(holder);
     try {
-      hcaptcha.render('box', {
+      hcaptcha.render(holder, {
         sitekey: sitekey,
         theme: (tg.colorScheme === 'light') ? 'light' : 'dark',
-        callback: function (token) {
-          if (finished) return;
-          finished = true;
-          status('Готово ✓ возвращаю в бот…', 'ok');
-          send({ token: token });
-        },
+        callback: onSolved,
         'expired-callback': function () {
           // Токен сгорел — виджет сам перерисуется, времени ещё хватает.
-          if (finished) return;
+          if (finished || sentRound === round) return;
           status('Капча истекла — реши ещё раз, быстро.', 'warn');
         },
         'error-callback': function (code) {
-          if (finished) return;
+          if (finished || sentRound === round) return;
           finished = true;
           status('Ошибка капчи: ' + code, 'err');
           send({ error: String(code || 'error') });
@@ -136,7 +178,16 @@
       status('Не удалось загрузить капчу.', 'err');
       send({ error: 'render:' + (e && e.message || e) });
     }
-  };
+  }
+
+  if (tg) { tg.ready(); tg.expand(); }
+  if (!tg || !tg.initData) { status('Открой страницу кнопкой в боте.', 'err'); return; }
+  if (!rid || !/^[0-9a-f-]{20,64}$/i.test(sitekey)) {
+    status('Ссылка устарела — запроси заново.', 'err');
+    return;
+  }
+
+  window.onHcaptchaLoad = function () { startRound(); };
 
   var s = document.createElement('script');
   s.src = 'https://js.hcaptcha.com/1/api.js?onload=onHcaptchaLoad&render=explicit&hl=ru';

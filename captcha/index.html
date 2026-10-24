@@ -99,8 +99,14 @@
   function send(payload) {
     payload.rid = rid;
     payload.round = round;
+    // Telegram Desktop на кнопке из чата отдаёт пустой initData, но sendData
+    // при этом работает — поэтому на initData ничего не завязано.  Если
+    // sendData всё-таки бросит, показываем текст ошибки, а не общую фразу.
     try { tg.sendData(JSON.stringify(payload)); }
-    catch (e) { status('Открой страницу кнопкой в боте.', 'err'); }
+    catch (e) {
+      status('Не удалось отправить ответ: ' + ((e && e.message) || e) +
+             '. Открой кнопкой в боте.', 'err');
+    }
   }
 
   function giveUp() {
@@ -161,9 +167,13 @@
         theme: (tg.colorScheme === 'light') ? 'light' : 'dark',
         callback: onSolved,
         'expired-callback': function () {
-          // Токен сгорел — виджет сам перерисуется, времени ещё хватает.
+          // Капча истекает сама, и это не повод закрывать задание: пока
+          // отсчёт идёт, сразу рисуем новую, чтобы человек не ждал.
           if (finished || sentRound === round) return;
-          status('Капча истекла — реши ещё раз, быстро.', 'warn');
+          status('Капча обновилась — реши новую, время ещё есть.', 'warn');
+          setTimeout(function () {
+            if (!finished && sentRound !== round) renderWidget();
+          }, 300);
         },
         'error-callback': function (code) {
           if (finished || sentRound === round) return;
@@ -181,7 +191,10 @@
   }
 
   if (tg) { tg.ready(); tg.expand(); }
-  if (!tg || !tg.initData) { status('Открой страницу кнопкой в боте.', 'err'); return; }
+  if (!tg || typeof tg.sendData !== 'function') {
+    status('Открой страницу кнопкой в боте — вне Telegram ответ отправить некуда.', 'err');
+    return;
+  }
   if (!rid || !/^[0-9a-f-]{20,64}$/i.test(sitekey)) {
     status('Ссылка устарела — запроси заново.', 'err');
     return;
